@@ -1,0 +1,15 @@
+outputs/
+raw_data/
+logs/
+wandb/
+__pycache__/
+*.pyc
+*.pyo
+*.pt
+*.npy
+*.npz
+*.parquet
+*.jsonl
+.ipynb_checkpoints/
+.DS_Store
+.env
