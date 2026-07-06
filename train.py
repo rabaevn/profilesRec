@@ -107,7 +107,9 @@ def main() -> None:
             weight_decay=args.weight_decay,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             batch_sampler=BatchSamplers.NO_DUPLICATES,
-            save_strategy="no",
+            save_strategy="steps",
+            save_steps=50000,
+            save_total_limit=2,
             eval_strategy="no",
             logging_strategy="steps",
             logging_steps=args.logging_steps,
@@ -124,6 +126,7 @@ def main() -> None:
             eval_item_to_text=eval_item_to_text,
             eval_batch_size=args.eval_batch_size,
             eval_doc_chunk_size=args.eval_doc_chunk_size,
+            eval_query_chunk_size=args.eval_query_chunk_size,
             filter_seen_items=args.filter_seen_items,
             output_dir=args.output_dir,
             best_metric_name=args.best_metric,
@@ -137,7 +140,23 @@ def main() -> None:
             loss=loss_fn,
             callbacks=[eval_callback],
         )
-        trainer.train()
+        resume_arg = getattr(args, "resume_from_checkpoint", "auto")
+        if resume_arg in (None, "none"):
+            resume = None
+        elif resume_arg == "auto":
+            from transformers.trainer_utils import get_last_checkpoint
+
+            last_ckpt = get_last_checkpoint(args.output_dir) if os.path.isdir(args.output_dir) else None
+            if last_ckpt:
+                print(f"Resuming training from latest checkpoint: {last_ckpt}")
+            else:
+                print("No existing checkpoint found; starting training from scratch.")
+            resume = last_ckpt
+        else:
+            print(f"Resuming training from checkpoint: {resume_arg}")
+            resume = resume_arg
+
+        trainer.train(resume_from_checkpoint=resume)
         final_step = trainer.state.global_step
     else:
         final_step = math.ceil(len(train_examples) / args.train_batch_size) * round(args.num_train_epochs)
@@ -165,6 +184,7 @@ def main() -> None:
         batch_size=args.eval_batch_size,
         doc_chunk_size=args.eval_doc_chunk_size,
         filter_seen_items=args.filter_seen_items,
+        query_chunk_size=args.eval_query_chunk_size,
     )
     final_test_metrics = recall_and_ndcg_at_ks(
         model=best_model,
@@ -174,6 +194,7 @@ def main() -> None:
         batch_size=args.eval_batch_size,
         doc_chunk_size=args.eval_doc_chunk_size,
         filter_seen_items=args.filter_seen_items,
+        query_chunk_size=args.eval_query_chunk_size,
     )
 
     final_dir = os.path.join(args.output_dir, "final")

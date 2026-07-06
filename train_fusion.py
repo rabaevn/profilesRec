@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -231,11 +232,102 @@ def resolve_profile_strings(
     return kept, profiles, has_profile
 
 
+def _texts_fingerprint(texts: Sequence[str], salt: str = "") -> str:
+    """Order-sensitive content hash — cache is valid only for the exact text list
+    (and salt, which should identify the encoder so a retrained backbone at the
+    same path does not reuse stale embeddings)."""
+    h = hashlib.sha1()
+    h.update(f"{salt}\x1e{len(texts)}\x1e".encode())
+    for t in texts:
+        h.update(t.encode("utf-8", "surrogatepass"))
+        h.update(b"\x1e")
+    return h.hexdigest()[:16]
+
+
+def encoder_cache_salt(checkpoint_path: str) -> str:
+    """Identify the encoder by checkpoint path + mtime (changes on retrain)."""
+    try:
+        mtime = int(os.path.getmtime(checkpoint_path))
+    except OSError:
+        mtime = 0
+    return f"{checkpoint_path}:{mtime}"
+
+
+def _atomic_np_save(path: str, arr: np.ndarray) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        np.save(f, arr)
+    os.replace(tmp, path)
+
+
+def encode_texts_cached(
+    model: SentenceTransformer,
+    texts: Sequence[str],
+    batch_size: int,
+    is_query: bool,
+    cache_dir: str,
+    cache_name: str,
+    cache_salt: str = "",
+    shard_size: int = 100_000,
+) -> np.ndarray:
+    """Encode texts, checkpointing shards to disk so an interrupted run resumes.
+
+    Cache files are keyed by a content fingerprint of `texts` (+ encoder salt),
+    so a stale cache (different encoder inputs) is simply ignored rather than
+    reused.
+    """
+    encode_fn = encode_queries if is_query else encode_documents
+    if not cache_dir:
+        return encode_fn(model, list(texts), batch_size=batch_size).astype(
+            np.float32, copy=False
+        )
+
+    os.makedirs(cache_dir, exist_ok=True)
+    fp = _texts_fingerprint(texts, salt=cache_salt)
+    final_path = os.path.join(cache_dir, f"{cache_name}_{fp}.npy")
+    if os.path.exists(final_path):
+        print(f"  emb cache hit: {final_path}", flush=True)
+        return np.load(final_path)
+
+    n = len(texts)
+    dim = model.get_sentence_embedding_dimension()
+    out = np.empty((n, dim), dtype=np.float32)
+    num_shards = (n + shard_size - 1) // shard_size
+    for shard_i, s in enumerate(range(0, n, shard_size)):
+        e = min(s + shard_size, n)
+        shard_path = os.path.join(cache_dir, f"{cache_name}_{fp}_shard{shard_i:05d}.npy")
+        if os.path.exists(shard_path):
+            emb = np.load(shard_path)
+            if emb.shape != (e - s, dim):
+                raise RuntimeError(
+                    f"Corrupt emb cache shard {shard_path}: "
+                    f"shape={emb.shape}, expected {(e - s, dim)}"
+                )
+            print(f"  emb cache shard {shard_i + 1}/{num_shards} loaded", flush=True)
+        else:
+            emb = encode_fn(model, list(texts[s:e]), batch_size=batch_size).astype(
+                np.float32, copy=False
+            )
+            _atomic_np_save(shard_path, emb)
+            print(f"  emb cache shard {shard_i + 1}/{num_shards} encoded+saved", flush=True)
+        out[s:e] = emb
+    _atomic_np_save(final_path, out)
+    for shard_i in range(num_shards):
+        shard_path = os.path.join(cache_dir, f"{cache_name}_{fp}_shard{shard_i:05d}.npy")
+        if os.path.exists(shard_path):
+            os.remove(shard_path)
+    print(f"  emb cache saved: {final_path}", flush=True)
+    return out
+
+
 def encode_with_dedup(
     model: SentenceTransformer,
     texts: Sequence[str],
     batch_size: int,
     is_query: bool,
+    cache_dir: str = "",
+    cache_name: str = "",
+    cache_salt: str = "",
 ) -> np.ndarray:
     """Encode unique texts once, then index back to the full list."""
     unique_to_idx: Dict[str, int] = {}
@@ -247,11 +339,10 @@ def encode_with_dedup(
             ordered_unique.append(t)
         indices.append(unique_to_idx[t])
 
-    if is_query:
-        unique_emb = encode_queries(model, ordered_unique, batch_size=batch_size)
-    else:
-        unique_emb = encode_documents(model, ordered_unique, batch_size=batch_size)
-    unique_emb = unique_emb.astype(np.float32, copy=False)
+    unique_emb = encode_texts_cached(
+        model, ordered_unique, batch_size, is_query,
+        cache_dir=cache_dir, cache_name=cache_name, cache_salt=cache_salt,
+    )
     return unique_emb[np.asarray(indices, dtype=np.int64)]
 
 
@@ -260,17 +351,37 @@ def encode_split(
     examples: Sequence[Example],
     profile_strings: Sequence[str],
     item_id_to_index: Dict[str, int],
-    catalog_emb: np.ndarray,
     encode_batch_size: int,
     has_profile: Sequence[float] | None = None,
+    cache_dir: str = "",
+    split_name: str = "",
+    cache_salt: str = "",
+    free_history_text: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, np.ndarray, np.ndarray, np.ndarray]:
-    """Encode a split. Returns query/profile/target tensors plus the numpy
+    """Encode a split. Returns query/profile/target-index tensors plus the numpy
     query_emb, numpy profile_emb (zeroed where has_profile==0), and has_profile
     array — so callers can build gate features (e.g. cos(q, p)).
+
+    Targets are returned as catalog *indices* (not embeddings): materializing
+    catalog rows per example costs n_examples x embed_dim float32 (~12G on
+    Steam) for rows already present in catalog_emb.
+
+    free_history_text drops each example's history_text once queries are
+    encoded — on Steam that's tens of GB of strings not needed afterwards.
     """
     queries = [x.history_text for x in examples]
-    query_emb = encode_with_dedup(model, queries, encode_batch_size, is_query=True)
-    profile_emb = encode_with_dedup(model, list(profile_strings), encode_batch_size, is_query=True)
+    query_emb = encode_with_dedup(
+        model, queries, encode_batch_size, is_query=True,
+        cache_dir=cache_dir, cache_name=f"{split_name}_query", cache_salt=cache_salt,
+    )
+    del queries
+    if free_history_text:
+        for ex in examples:
+            object.__setattr__(ex, "history_text", "")  # Example is frozen
+    profile_emb = encode_with_dedup(
+        model, list(profile_strings), encode_batch_size, is_query=True,
+        cache_dir=cache_dir, cache_name=f"{split_name}_profile", cache_salt=cache_salt,
+    )
 
     if has_profile is None:
         has_profile_arr = np.ones(len(examples), dtype=np.float32)
@@ -282,12 +393,11 @@ def encode_split(
     target_indices = np.asarray(
         [item_id_to_index[x.target_item_id] for x in examples], dtype=np.int64
     )
-    target_emb = catalog_emb[target_indices]
 
     return (
         torch.from_numpy(query_emb).float(),
         torch.from_numpy(profile_emb).float(),
-        torch.from_numpy(target_emb).float(),
+        torch.from_numpy(target_indices),
         query_emb,
         profile_emb,
         has_profile_arr,
@@ -452,12 +562,22 @@ def main() -> None:
     catalog_texts = [eval_item_to_text[i] for i in item_ids]
 
     # ---- profiles
-    profile_cache = load_profile_cache(args.llm_profile_cache)
+    # Only keys reachable from the train/val examples are ever looked up, so we
+    # filter the cache at load time. On large datasets (Steam ~3M prefixes) this
+    # is the difference between a few hundred MB and several GB of resident dict.
+    needed_keys = {
+        profile_cache_key(ex.history_item_ids, args.llm_profile_max_history)
+        for ex in (*train_examples, *val_examples)
+    }
+    profile_cache = load_profile_cache(args.llm_profile_cache, keep_keys=needed_keys)
     if not profile_cache:
         raise SystemExit(
             f"Profile cache at {args.llm_profile_cache!r} is empty — run generate_profiles.py first."
         )
-    print(f"Loaded {len(profile_cache):,} profiles from cache.")
+    print(
+        f"Loaded {len(profile_cache):,} profiles from cache "
+        f"({len(needed_keys):,} keys needed by examples)."
+    )
 
     is_gated = args.fusion_head_type == "gated_profile"
     train_examples, train_profiles, train_has_prof = resolve_profile_strings(
@@ -468,6 +588,9 @@ def main() -> None:
     )
     if not train_examples or not val_examples:
         raise SystemExit("No examples left after profile resolution — check the cache.")
+    # The filtered cache is still millions of strings on large datasets; the
+    # resolved per-split profile lists are all that's needed from here on.
+    del profile_cache, needed_keys
 
     # ---- gate feature setup (gated_profile only)
     gate_feature_names: List[str] = []
@@ -481,6 +604,10 @@ def main() -> None:
             json.dump(item_log_pop, f)
         print(f"Saved item log-popularity map -> {log_pop_path}")
 
+    # Raw interactions/sequences are no longer needed once examples, the eval
+    # catalog and item_log_pop exist (Steam: ~3.8M interaction objects).
+    del interactions, user_sequences
+
     # ---- frozen encoder + one-shot embedding
     print(f"Loading frozen seqrec encoder from {args.seqrec_checkpoint}")
     encoder = SentenceTransformer(args.seqrec_checkpoint)
@@ -491,22 +618,34 @@ def main() -> None:
     embed_dim = encoder.get_sentence_embedding_dimension()
     print(f"seqrec embed_dim = {embed_dim}")
 
+    emb_cache_dir = args.emb_cache_dir
+    emb_cache_salt = encoder_cache_salt(args.seqrec_checkpoint) if emb_cache_dir else ""
+    if emb_cache_dir:
+        print(f"Embedding cache dir: {emb_cache_dir} (salt={emb_cache_salt})")
+
     print(f"Encoding catalog ({len(catalog_texts):,} items)...")
-    catalog_emb_np = encode_documents(encoder, catalog_texts, batch_size=args.encode_batch_size).astype(
-        np.float32, copy=False
+    catalog_emb_np = encode_texts_cached(
+        encoder, catalog_texts, args.encode_batch_size, is_query=False,
+        cache_dir=emb_cache_dir, cache_name="catalog", cache_salt=emb_cache_salt,
     )
     catalog_emb = torch.from_numpy(catalog_emb_np)
 
     print("Encoding train split...")
-    train_q, train_p, train_t, train_q_np, train_p_np, train_has_prof_np = encode_split(
-        encoder, train_examples, train_profiles, item_id_to_index, catalog_emb_np,
+    train_q, train_p, train_t_idx, train_q_np, train_p_np, train_has_prof_np = encode_split(
+        encoder, train_examples, train_profiles, item_id_to_index,
         args.encode_batch_size, has_profile=train_has_prof,
+        cache_dir=emb_cache_dir, split_name="train", cache_salt=emb_cache_salt,
+        free_history_text=True,
     )
+    del train_profiles
     print("Encoding val split...")
-    val_q, val_p, val_t, val_q_np, val_p_np, val_has_prof_np = encode_split(
-        encoder, val_examples, val_profiles, item_id_to_index, catalog_emb_np,
+    val_q, val_p, _val_t_idx, val_q_np, val_p_np, val_has_prof_np = encode_split(
+        encoder, val_examples, val_profiles, item_id_to_index,
         args.encode_batch_size, has_profile=val_has_prof,
+        cache_dir=emb_cache_dir, split_name="val", cache_salt=emb_cache_salt,
+        free_history_text=True,
     )
+    del val_profiles
 
     train_feats_t: torch.Tensor | None = None
     val_feats_t: torch.Tensor | None = None
@@ -536,9 +675,7 @@ def main() -> None:
     train_y_oracle_np: np.ndarray | None = None
     aux_pos_weight_t: torch.Tensor | None = None
     if is_gated and args.gate_aux_lambda > 0.0:
-        train_gold_np = np.asarray(
-            [item_id_to_index[x.target_item_id] for x in train_examples], dtype=np.int64,
-        )
+        train_gold_np = train_t_idx.numpy()
         print(
             f"Computing oracle labels: objective={args.gate_aux_objective} "
             f"alpha={args.gate_aux_alpha:.2f} "
@@ -653,14 +790,16 @@ def main() -> None:
             weight_decay=args.fusion_weight_decay,
         )
 
+    # Targets are stored as catalog indices; the training loop gathers the
+    # embedding rows from catalog_emb_device per batch.
     if is_gated:
         train_ds = GatedFusionDataset(
-            train_q, train_p, train_t, train_feats_t, train_has_prof_t,
+            train_q, train_p, train_t_idx, train_feats_t, train_has_prof_t,
             weights=train_weights_t,
             y_oracle=train_y_oracle_t,
         )
     else:
-        train_ds = FusionTripleDataset(train_q, train_p, train_t)
+        train_ds = FusionTripleDataset(train_q, train_p, train_t_idx)
     loader = DataLoader(
         train_ds,
         batch_size=args.fusion_batch_size,
@@ -709,10 +848,10 @@ def main() -> None:
         epoch_gate_y0_n = 0
         for batch in loader:
             if is_gated:
-                q, p, t, feats, hp, w, y_oracle = batch
+                q, p, t_idx, feats, hp, w, y_oracle = batch
                 q = q.to(device)
                 p = p.to(device)
-                t = t.to(device)
+                t = catalog_emb_device[t_idx.to(device)]
                 feats = feats.to(device)
                 hp = hp.to(device)
                 w = w.to(device)
@@ -755,10 +894,10 @@ def main() -> None:
                         unw = info_nce_loss(fused, t, temperature=args.fusion_temperature)
                         epoch_loss_unweighted += float(unw.item()) * q.shape[0]
             else:
-                q, p, t = batch
+                q, p, t_idx = batch
                 q = q.to(device)
                 p = p.to(device)
-                t = t.to(device)
+                t = catalog_emb_device[t_idx.to(device)]
                 fused = head(q, p)
                 loss = info_nce_loss(fused, t, temperature=args.fusion_temperature)
             optim.zero_grad()

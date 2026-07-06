@@ -18,7 +18,7 @@ import pandas as pd
 from sentence_transformers import SentenceTransformer
 
 from data import (
-    AMAZON2018_URLS,
+    DATASET_REGISTRY,
     Example,
     HistoryFormatConfig,
     build_eval_catalog,
@@ -29,6 +29,7 @@ from data import (
 )
 from evaluation import encode_documents, encode_queries
 from utils import save_json, set_seed
+import cohort_dims
 
 
 def parse_args() -> argparse.Namespace:
@@ -36,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seqrec-checkpoint", type=str,
                    default="outputs/seqrec_qwen3_beauty/best")
     p.add_argument("--dataset-name", type=str,
-                   choices=sorted(AMAZON2018_URLS.keys()), default="Beauty")
+                   choices=sorted(DATASET_REGISTRY.keys()), default="Beauty")
     p.add_argument("--root", type=str, default="./raw_data")
     p.add_argument("--rating-score", type=float, default=0.0)
     p.add_argument("--download-if-missing", action="store_true", default=True)
@@ -274,6 +275,8 @@ def main() -> None:
         "hit@10": rank <= 10,
         "ndcg@10": np.where(rank <= 10, 1.0 / np.log2(rank.astype(np.float64) + 1.0), 0.0),
     })
+    # extra cohort axes baked into the baseline parquet too (see cohort_dims).
+    df = cohort_dims.add_activity_age_columns(df, interactions)
 
     # ---------- aggregate ----------
     overall = _agg(np.ones(len(rank), dtype=bool), rank)

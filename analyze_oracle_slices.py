@@ -19,6 +19,8 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+import cohort_dims
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
@@ -27,6 +29,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-json", type=str, required=True)
     p.add_argument("--bootstrap-reps", type=int, default=1000)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--dataset-name", type=str, default=None,
+                   help="If set, back-fill user_activity/target_first_ts cohort "
+                        "columns from this dataset's interactions when the parquet "
+                        "predates them (enables activity/age cohorts on legacy runs).")
+    p.add_argument("--root", type=str, default="./raw_data")
     return p.parse_args()
 
 
@@ -184,6 +191,21 @@ def main() -> None:
     df["pop"] = df["target_freq"].map(pop_bin)
     print(f"popularity quintile edges (train freq): {pop_edges}")
 
+    # new cohort axes: user_activity + target item age (back-fill if absent)
+    have_new = {"user_activity", "target_first_ts"}.issubset(df.columns)
+    if not have_new and args.dataset_name:
+        print(f"Back-filling user_activity/target_first_ts from {args.dataset_name} ...")
+        df = cohort_dims.backfill_from_dataset(df, args.dataset_name, root=args.root)
+        have_new = True
+    if have_new:
+        df["activity"], act_edges = cohort_dims.activity_buckets(df["user_activity"])
+        df["age"], age_edges = cohort_dims.age_buckets(df["target_first_ts"])
+        print(f"activity tertile edges (total user interactions): {act_edges}")
+        print(f"item-age tertile edges (target first_ts): {age_edges}")
+    else:
+        print("[note] user_activity/target_first_ts absent and no --dataset-name; "
+              "skipping activity/age cohorts.")
+
     rng = np.random.default_rng(args.seed)
     R = args.bootstrap_reps
 
@@ -199,6 +221,17 @@ def main() -> None:
     cohorts.append(cohort_block(df, "long-hist x popular (21+ x Q5)", ((df["hl"] == "21+") & (df["pop"] == "Q5")).to_numpy(), R, rng))
     cohorts.append(cohort_block(df, "has_profile=True (warm cache)",  df["has_profile"].astype(bool).to_numpy(), R, rng))
     cohorts.append(cohort_block(df, "has_profile=False (cold cache)", (~df["has_profile"].astype(bool)).to_numpy(), R, rng))
+
+    # new axis: user activity volume (light/medium/heavy total interactions)
+    if "activity" in df.columns:
+        for lvl in cohort_dims.ACTIVITY_LABELS:
+            cohorts.append(cohort_block(
+                df, f"activity {lvl}", (df["activity"] == lvl).to_numpy(), R, rng))
+    # new axis: target item age (established/mid/new by first-interaction ts)
+    if "age" in df.columns:
+        for lvl in cohort_dims.AGE_LABELS:
+            cohorts.append(cohort_block(
+                df, f"item-age {lvl}", (df["age"] == lvl).to_numpy(), R, rng))
 
     # gate tertiles among profile-present examples (gate is meaningful only there)
     if "gate" in df.columns and not df["gate"].isna().all():
@@ -257,6 +290,9 @@ def main() -> None:
         "bootstrap_reps": R,
         "cohorts": cohorts,
     }
+    if "activity" in df.columns:
+        out["activity_edges"] = list(act_edges)
+        out["age_edges"] = list(age_edges)
     with open(args.output_json, "w") as f:
         json.dump(out, f, indent=2)
     print(f"\nWrote: {args.output_json}")

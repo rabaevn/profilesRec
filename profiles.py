@@ -66,9 +66,11 @@ def build_profile_prompt(
         title = item_to_text.get(inter.item_id, "Item")
         if title.startswith("Item: "):
             title = title[len("Item: "):]
-        title = truncate_words(title, title_words)
+        # Char caps bound CJK / no-space text, which truncate_words (whitespace-split)
+        # cannot — without them a single multilingual review can blow past the LLM context.
+        title = truncate_words(title, title_words)[: title_words * 12]
         rating_str = f"{int(round(inter.rating))}★" if inter.rating > 0 else "no rating"
-        review = truncate_words(inter.review_text or "", review_words).replace("\n", " ").strip()
+        review = truncate_words(inter.review_text or "", review_words)[: review_words * 10].replace("\n", " ").strip()
         if review:
             lines.append(f"{idx}. {title} — {rating_str} — review: \"{review}\"")
         else:
@@ -194,9 +196,19 @@ def extract_final_summary(raw: str) -> str:
     return text.strip().replace("\n", " ").strip()
 
 
-def load_profile_cache(path: str) -> Dict[str, str]:
+def load_profile_cache(
+    path: str, keep_keys: Optional[Iterable[str]] = None
+) -> Dict[str, str]:
+    """Load the profile cache into a dict.
+
+    When ``keep_keys`` is given, only entries whose key is in that set are
+    retained. Large caches (e.g. Steam has ~3M prefixes) hold every history
+    window, but a fusion run only touches one prefix per example; filtering at
+    load time keeps peak memory bounded by the examples actually used.
+    """
     if not os.path.exists(path):
         return {}
+    keep = set(keep_keys) if keep_keys is not None else None
     out: Dict[str, str] = {}
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
@@ -207,7 +219,8 @@ def load_profile_cache(path: str) -> Dict[str, str]:
             key = row.get("key")
             profile = row.get("profile")
             if isinstance(key, str) and isinstance(profile, str):
-                out[key] = profile
+                if keep is None or key in keep:
+                    out[key] = profile
     return out
 
 

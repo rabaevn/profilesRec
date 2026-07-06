@@ -21,7 +21,7 @@ import torch
 from sentence_transformers import SentenceTransformer
 
 from data import (
-    AMAZON2018_URLS,
+    DATASET_REGISTRY,
     HistoryFormatConfig,
     build_eval_catalog,
     build_examples,
@@ -33,6 +33,7 @@ from evaluation import encode_documents, encode_queries
 from fusion import FusionHead, GatedProfileFusionHead
 from profiles import load_profile_cache, profile_cache_key
 from train_fusion import build_user_gate_features, fill_cos_q_p
+import cohort_dims
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,7 +46,7 @@ def parse_args() -> argparse.Namespace:
                    default="outputs/profiles_beauty_v6_cot_cf.jsonl")
     p.add_argument("--llm-profile-max-history", type=int, default=20)
     p.add_argument("--dataset-name", type=str,
-                   choices=sorted(AMAZON2018_URLS.keys()), default="Beauty")
+                   choices=sorted(DATASET_REGISTRY.keys()), default="Beauty")
     p.add_argument("--root", type=str, default="./raw_data")
     p.add_argument("--rating-score", type=float, default=0.0)
     p.add_argument("--download-if-missing", action="store_true", default=True)
@@ -194,10 +195,19 @@ def main() -> None:
     catalog_texts = [eval_item_to_text[i] for i in item_ids]
 
     # --- profile cache: map every test example to (profile_string | None)
-    profile_cache = load_profile_cache(args.llm_profile_cache)
+    # Filter to keys reachable from test examples so large caches (Steam ~3M
+    # prefixes) don't blow up resident memory.
+    needed_keys = {
+        profile_cache_key(ex.history_item_ids, args.llm_profile_max_history)
+        for ex in test_examples
+    }
+    profile_cache = load_profile_cache(args.llm_profile_cache, keep_keys=needed_keys)
     if not profile_cache:
         raise SystemExit(f"Profile cache at {args.llm_profile_cache!r} is empty.")
-    print(f"Loaded {len(profile_cache):,} profile entries from cache.")
+    print(
+        f"Loaded {len(profile_cache):,} profile entries from cache "
+        f"({len(needed_keys):,} keys needed by test examples)."
+    )
 
     profile_strs: List[str] = []
     has_profile: List[bool] = []
@@ -349,6 +359,9 @@ def main() -> None:
         "hit10_zero": rank_zero <= 10,
         "gate": gate_prof,
     })
+    # extra cohort axes (user activity volume + target item age); pure functions
+    # of interactions, see cohort_dims / analyze_oracle_slices.
+    df = cohort_dims.add_activity_age_columns(df, interactions)
 
     # join baseline (text-only) ranks if available
     if args.baseline_per_example and os.path.exists(args.baseline_per_example):

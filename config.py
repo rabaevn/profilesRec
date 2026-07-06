@@ -2,16 +2,16 @@ from __future__ import annotations
 
 import argparse
 
-from data import AMAZON2018_URLS
+from data import DATASET_REGISTRY
 
 
 def _add_data_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--dataset-name",
         type=str,
-        choices=sorted(AMAZON2018_URLS.keys()),
+        choices=sorted(DATASET_REGISTRY.keys()),
         default="Beauty",
-        help="Amazon 2018 category name.",
+        help="Dataset name (Amazon category / MovieLens-1M / Steam / Yelp).",
     )
     parser.add_argument("--root", type=str, default="./raw_data", help="Root directory for downloaded SNAP files.")
     parser.add_argument(
@@ -70,6 +70,14 @@ def _add_eval_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--eval-batch-size", type=int, default=8)
     parser.add_argument("--eval-doc-chunk-size", type=int, default=4096)
     parser.add_argument(
+        "--eval-query-chunk-size",
+        type=int,
+        default=0,
+        help="If > 0, process eval queries in chunks of this size. Bounds memory "
+             "for large val/test sets (e.g. Steam @ 331k queries OOMed at 0). "
+             "Default 0 = process all queries at once (legacy behavior).",
+    )
+    parser.add_argument(
         "--eval-catalog",
         type=str,
         choices=["interacted", "metadata"],
@@ -110,6 +118,17 @@ def parse_args() -> argparse.Namespace:
         choices=["ndcg@10", "recall@10", "ndcg@5", "recall@5"],
         default="ndcg@10",
         help="Validation metric used to pick the best checkpoint.",
+    )
+
+    parser.add_argument(
+        "--resume-from-checkpoint",
+        type=str,
+        nargs="?",
+        const="auto",
+        default="auto",
+        help="Resume training from a checkpoint. With no value (or 'auto'), resumes from "
+        "the latest checkpoint-* in --output-dir if one exists, else starts fresh. "
+        "Pass a path to resume from a specific checkpoint, or 'none' to force a fresh start.",
     )
 
     parser.add_argument("--wandb-project", type=str, default="amazon-next-item-st")
@@ -394,6 +413,14 @@ def parse_fusion_args() -> argparse.Namespace:
         type=int,
         default=128,
         help="Batch size used for the one-shot pre-encoding pass.",
+    )
+    parser.add_argument(
+        "--emb-cache-dir",
+        type=str,
+        default="",
+        help="Optional dir for the on-disk embedding cache. Encoding checkpoints "
+             "in shards so a killed run resumes, and identical inputs (same texts "
+             "+ encoder outputs) are reused across runs, e.g. for ablations.",
     )
     parser.add_argument(
         "--fusion-device",
