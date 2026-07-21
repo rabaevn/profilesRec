@@ -29,10 +29,17 @@ from data import (
     load_interactions,
     load_item_texts,
 )
-from evaluation import encode_documents, encode_queries
 from fusion import FusionHead, GatedProfileFusionHead
 from profiles import load_profile_cache, profile_cache_key
-from train_fusion import build_user_gate_features, fill_cos_q_p
+from ranking import per_example_ranks  # shared rank path; do not reimplement locally
+from train_fusion import (
+    build_user_gate_features,
+    encode_texts_cached,
+    encode_with_dedup,
+    encoder_cache_salt,
+    fill_cos_q_p,
+    resolve_profile_strings,
+)
 import cohort_dims
 
 
@@ -60,6 +67,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--scoring-chunk-size", type=int, default=2048)
     p.add_argument("--filter-seen-items", action="store_true",
                    help="Mask items in the user's history before ranking (matches train_fusion.py).")
+    p.add_argument("--split", type=str, choices=["test", "val"], default="test")
+    p.add_argument("--emb-cache-dir", type=str, default="",
+                   help="Sharded embedding cache dir (share with train_fusion, "
+                        "e.g. outputs/emb_cache_<tag>). Empty = no caching.")
     p.add_argument("--output-dir", type=str,
                    default="outputs/fusion_beauty_v6cf/slices")
     p.add_argument("--fusion-device", type=str, default="cuda")
@@ -70,55 +81,53 @@ def parse_args() -> argparse.Namespace:
 
 
 @torch.no_grad()
-def per_example_ranks_fused(
+def fused_embeddings(
     head: torch.nn.Module,
     query_emb: torch.Tensor,
     profile_emb: torch.Tensor,
-    catalog_emb: torch.Tensor,
-    gold_indices: torch.Tensor,
     device: str,
     chunk_size: int,
     has_profile: torch.Tensor | None = None,
     hist_feats: torch.Tensor | None = None,
     bypass_head: bool = False,
-    seen_indices: List[torch.Tensor] | None = None,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Return (ranks, gate_values). gate_values is all-NaN for non-gated heads.
+) -> Tuple[torch.Tensor, np.ndarray, np.ndarray]:
+    """Run the head chunk-wise and return (fused (N, D) cpu float32, gate_mean,
+    gate_std). Gate arrays are all-NaN for non-gated heads; for scalar gates
+    gate_mean is the gate itself and gate_std is 0. Ranking happens separately
+    in ranking.per_example_ranks so every script shares one rank path.
 
-    When `bypass_head=True`, the head is skipped and ranking falls back to the
-    text-only baseline `normalize(q) @ catalog.T`. Used to ablate the profile
-    contribution of a non-gated head without taking the head off-distribution
-    (concat([q, 0]) -> Linear(2D,D) does NOT reproduce the baseline).
+    When `bypass_head=True`, the head is skipped and the output is the raw
+    query embedding — the text-only baseline. q is returned WITHOUT an extra
+    normalize: cosine ranks are invariant to per-query scaling, and skipping
+    it keeps the zero-pass score matrix bit-identical to evaluate_slices'
+    baseline (a float32 renormalize of an already-unit q shifts values by
+    ~1e-8, enough to flip near-ties between duplicate item texts). Non-gated
+    heads must be bypassed anyway (concat([q, 0]) -> Linear(2D,D) does NOT
+    reproduce the baseline).
     """
     head.eval()
     is_gated = isinstance(head, GatedProfileFusionHead)
     n_q = query_emb.shape[0]
-    catalog_dev = catalog_emb.to(device)
-    ranks = np.zeros(n_q, dtype=np.int64)
-    gate_vals = np.full(n_q, np.nan, dtype=np.float32)
+    fused_out = torch.empty_like(query_emb)
+    gate_mean = np.full(n_q, np.nan, dtype=np.float32)
+    gate_std = np.full(n_q, np.nan, dtype=np.float32)
     for s in range(0, n_q, chunk_size):
         e = min(s + chunk_size, n_q)
         q = query_emb[s:e].to(device)
         p = profile_emb[s:e].to(device)
         if bypass_head:
-            fused = torch.nn.functional.normalize(q, dim=-1)
+            fused = q
         elif is_gated:
             hp = has_profile[s:e].to(device)
             hf = hist_feats[s:e].to(device)
             fused = head(q, p, hp, hf)
-            gate_vals[s:e] = head.gate(hf, hp).squeeze(-1).cpu().numpy()
+            g = head.gate(hf, hp)  # (b, 1) scalar heads, (b, D) FiLM
+            gate_mean[s:e] = g.mean(dim=-1).cpu().numpy()
+            gate_std[s:e] = g.std(dim=-1, unbiased=False).cpu().numpy()
         else:
             fused = head(q, p)
-        scores = fused @ catalog_dev.T                # (b, C)
-        if seen_indices is not None:
-            for j, idx in enumerate(seen_indices[s:e]):
-                if idx.numel() > 0:
-                    scores[j, idx.to(device)] = float("-inf")
-        gold = gold_indices[s:e].to(device)
-        gold_scores = scores.gather(1, gold.view(-1, 1)).squeeze(1)
-        higher = (scores > gold_scores.unsqueeze(1)).sum(dim=1)
-        ranks[s:e] = (higher + 1).cpu().numpy()
-    return ranks, gate_vals
+        fused_out[s:e] = fused.float().cpu()
+    return fused_out, gate_mean, gate_std
 
 
 def _ndcg10(rank: np.ndarray) -> float:
@@ -177,13 +186,14 @@ def main() -> None:
         valid_item_ids=set(item_to_text.keys()),
     )
     user_sequences = build_user_sequences(interactions)
-    _train, _val, test_examples = build_examples(
+    _train, val_examples, test_examples = build_examples(
         user_sequences=user_sequences,
         item_to_text=item_to_text,
         min_user_seq_len=args.min_user_seq_len,
         max_history_items=args.max_history_items,
         fmt=fmt,
     )
+    test_examples = val_examples if args.split == "val" else test_examples
 
     eval_item_to_text = build_eval_catalog(
         item_to_text=item_to_text,
@@ -206,18 +216,17 @@ def main() -> None:
         raise SystemExit(f"Profile cache at {args.llm_profile_cache!r} is empty.")
     print(
         f"Loaded {len(profile_cache):,} profile entries from cache "
-        f"({len(needed_keys):,} keys needed by test examples)."
+        f"({len(needed_keys):,} keys needed by {args.split} examples)."
     )
 
-    profile_strs: List[str] = []
-    has_profile: List[bool] = []
-    for ex in test_examples:
-        key = profile_cache_key(ex.history_item_ids, args.llm_profile_max_history)
-        prof = profile_cache.get(key)
-        has_profile.append(prof is not None)
-        profile_strs.append(prof if prof is not None else "")
+    # keep_missing=True keeps every example (empty profile string, has_profile=0)
+    # and matches train_fusion's encoding inputs, so the profile emb cache hits.
+    test_examples, profile_strs, has_profile = resolve_profile_strings(
+        test_examples, profile_cache, args.llm_profile_max_history, keep_missing=True
+    )
+    del profile_cache, needed_keys
     n_missing = sum(1 for h in has_profile if not h)
-    print(f"Test examples: {len(test_examples):,} total, {n_missing:,} without profile.")
+    print(f"{args.split} examples: {len(test_examples):,} total, {n_missing:,} without profile.")
 
     # --- encode
     print(f"Loading encoder from {args.seqrec_checkpoint}")
@@ -227,33 +236,35 @@ def main() -> None:
         p.requires_grad_(False)
     embed_dim = encoder.get_sentence_embedding_dimension()
 
+    cache_salt = encoder_cache_salt(args.seqrec_checkpoint) if args.emb_cache_dir else ""
+    if args.emb_cache_dir:
+        print(f"Embedding cache dir: {args.emb_cache_dir} (salt={cache_salt})")
+
     print(f"Encoding catalog ({len(item_ids):,} items)...")
-    catalog_np = encode_documents(encoder, catalog_texts,
-                                  batch_size=args.encode_batch_size).astype(np.float32, copy=False)
+    catalog_np = encode_texts_cached(
+        encoder, catalog_texts, args.encode_batch_size, is_query=False,
+        cache_dir=args.emb_cache_dir, cache_name="catalog", cache_salt=cache_salt,
+    )
     catalog_emb = torch.from_numpy(catalog_np)
 
     print(f"Encoding queries ({len(test_examples):,})...")
     queries = [ex.history_text for ex in test_examples]
-    query_np = encode_queries(encoder, queries,
-                              batch_size=args.encode_batch_size).astype(np.float32, copy=False)
+    query_np = encode_with_dedup(
+        encoder, queries, args.encode_batch_size, is_query=True,
+        cache_dir=args.emb_cache_dir, cache_name=f"{args.split}_query",
+        cache_salt=cache_salt,
+    )
 
-    print(f"Encoding profile strings (deduped)...")
-    # Dedup non-empty profiles
-    uniq: Dict[str, int] = {}
-    uniq_list: List[str] = []
-    for s in profile_strs:
-        if s and s not in uniq:
-            uniq[s] = len(uniq_list)
-            uniq_list.append(s)
-    if uniq_list:
-        uniq_emb = encode_queries(encoder, uniq_list,
-                                  batch_size=args.encode_batch_size).astype(np.float32, copy=False)
-    else:
-        uniq_emb = np.zeros((0, embed_dim), dtype=np.float32)
-    profile_np = np.zeros((len(test_examples), embed_dim), dtype=np.float32)
-    for i, s in enumerate(profile_strs):
-        if s:
-            profile_np[i] = uniq_emb[uniq[s]]
+    print("Encoding profile strings (deduped)...")
+    has_profile_arr = np.asarray(has_profile, dtype=np.float32)
+    profile_np = encode_with_dedup(
+        encoder, profile_strs, args.encode_batch_size, is_query=True,
+        cache_dir=args.emb_cache_dir, cache_name=f"{args.split}_profile",
+        cache_salt=cache_salt,
+    )
+    # Empty-string profiles get a real embedding above (same inputs as
+    # train_fusion, so the cache hits); zero them here like encode_split does.
+    profile_np = profile_np * has_profile_arr[:, None]
 
     query_emb = torch.from_numpy(query_np)
     profile_emb = torch.from_numpy(profile_np)
@@ -264,15 +275,16 @@ def main() -> None:
     ckpt = torch.load(args.fusion_head_path, map_location="cpu")
     head_type = ckpt.get("head_type", "mlp")
     mlp_hidden = int(ckpt.get("mlp_hidden", 512))
-    if head_type == "gated_profile":
+    if head_type in ("gated_profile", "gated_profile_film"):
         gate_features = ckpt["gate_features"]
         head: torch.nn.Module = GatedProfileFusionHead(
             embed_dim=embed_dim,
             num_gate_features=len(gate_features),
             gate_mlp_hidden=int(ckpt.get("gate_mlp_hidden", 16)),
             gate_logit_init=float(ckpt.get("gate_logit_init", -6.0)),
+            gate_out_dim=int(ckpt.get("gate_out_dim", 1)),
         )
-        print(f"  gated_profile head; gate_features={gate_features}")
+        print(f"  {head_type} head; gate_features={gate_features}")
     else:
         head = FusionHead(embed_dim=embed_dim, head_type=head_type, mlp_hidden=mlp_hidden)
     head.load_state_dict(ckpt["state_dict"])
@@ -287,7 +299,6 @@ def main() -> None:
         )
         with open(log_pop_path) as f:
             item_log_pop = json.load(f)
-        has_profile_arr = np.asarray(has_profile, dtype=np.float32)
         feats_np = build_user_gate_features(
             test_examples, has_profile_arr.tolist(), item_log_pop, gate_features,
         )
@@ -321,23 +332,30 @@ def main() -> None:
         print(f"filter_seen_items=True; mean seen-items per query: {mean_seen:.2f}")
 
     print("Computing ranks WITH profile...")
-    rank_prof, gate_prof = per_example_ranks_fused(
-        head, query_emb, profile_emb, catalog_emb, gold_indices,
+    fused_prof, gate_prof, gate_std_prof = fused_embeddings(
+        head, query_emb, profile_emb,
         device=device, chunk_size=args.scoring_chunk_size,
         has_profile=has_profile_t, hist_feats=hist_feats_t,
-        seen_indices=seen_indices_t,
+    )
+    rank_prof = per_example_ranks(
+        fused_prof, catalog_emb, gold_indices,
+        seen_indices=seen_indices_t, device=device,
     )
     is_gated = isinstance(head, GatedProfileFusionHead)
-    if is_gated:
-        print("Computing ranks WITH zero profile (gate forced off)...")
-    else:
-        print("Computing ranks WITH zero profile (head bypassed -> text-only baseline)...")
-    rank_zero, _gate_zero = per_example_ranks_fused(
-        head, query_emb, profile_zero, catalog_emb, gold_indices,
+    # Zero pass: for gated heads the masked residual is exactly 0, so the head
+    # output is normalize(q) — mathematically the text-only baseline. Bypass
+    # the head so the zero ranks are also *bitwise* identical to the
+    # evaluate_slices baseline (see fused_embeddings docstring).
+    print("Computing ranks WITH zero profile (head bypassed -> text-only baseline)...")
+    fused_zero, _gz, _gzs = fused_embeddings(
+        head, query_emb, profile_zero,
         device=device, chunk_size=args.scoring_chunk_size,
         has_profile=has_profile_zero_t, hist_feats=hist_feats_zero_t,
-        bypass_head=not is_gated,
-        seen_indices=seen_indices_t,
+        bypass_head=True,
+    )
+    rank_zero = per_example_ranks(
+        fused_zero, catalog_emb, gold_indices,
+        seen_indices=seen_indices_t, device=device,
     )
 
     # --- per-example dataframe + cohort columns (match evaluate_slices.py)
@@ -358,6 +376,7 @@ def main() -> None:
         "hit10_prof": rank_prof <= 10,
         "hit10_zero": rank_zero <= 10,
         "gate": gate_prof,
+        "gate_std": gate_std_prof,
     })
     # extra cohort axes (user activity volume + target item age); pure functions
     # of interactions, see cohort_dims / analyze_oracle_slices.

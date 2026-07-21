@@ -1,5 +1,13 @@
 # Oracle Multi-Domain Pipeline
 
+> **Status (2026-07-21): the oracle head is now an ABLATION, not the main
+> method.** The thesis headline method is FiLM per-dimension gated fusion
+> (no oracle aux) — see `md_files/FILM_FUSION_METHOD.md`. The oracle aux loss
+> was found to *hurt* on Amazon and be unnecessary on Steam/ml1m
+> (no-oracle ablation, 2026-07-16). This doc records the oracle-head results
+> that FiLM is compared against; the shared pipeline steps 1-6 below still
+> produce the backbone / profile cache / baseline slices that FiLM reuses.
+
 Multi-domain replication of the Beauty oracle-R@10 pipeline
 (`run_oracle_pipeline.sh`) across Toys, Sports, and Home_and_Kitchen.
 

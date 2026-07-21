@@ -171,6 +171,10 @@ class GatedProfileFusionHead(nn.Module):
     Forward: out = q + sigmoid(gate_mlp(LN(features)) + bias) * has_profile * proj(p)
     Then L2-normalize.
 
+    gate_out_dim=1 is the scalar gate; gate_out_dim=embed_dim is the FiLM-style
+    per-dimension gate g in (0,1)^D ("gated_profile_film"), letting the profile
+    residual modulate individual embedding dimensions.
+
     Invariants (mirror LearnableCfFusionHead):
       - proj zero-initialized -> at step 0, out == normalize(q) exactly, regardless of
         gate value or profile content. Gradients still flow from step 1.
@@ -189,18 +193,20 @@ class GatedProfileFusionHead(nn.Module):
         num_gate_features: int,
         gate_mlp_hidden: int = 16,
         gate_logit_init: float = -6.0,
+        gate_out_dim: int = 1,
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
         self.num_gate_features = num_gate_features
         self.gate_mlp_hidden = gate_mlp_hidden
         self.gate_logit_init = float(gate_logit_init)
+        self.gate_out_dim = int(gate_out_dim)
 
         self.feature_norm = nn.LayerNorm(num_gate_features)
         self.gate_mlp = nn.Sequential(
             nn.Linear(num_gate_features, gate_mlp_hidden),
             nn.GELU(),
-            nn.Linear(gate_mlp_hidden, 1),
+            nn.Linear(gate_mlp_hidden, self.gate_out_dim),
         )
         # Bias-init the final logit so sigmoid starts near 0 (off by default).
         with torch.no_grad():
@@ -210,15 +216,21 @@ class GatedProfileFusionHead(nn.Module):
         with torch.no_grad():
             self.proj.weight.zero_()
 
-        self.head_type = "gated_profile"
+        self.head_type = "gated_profile" if self.gate_out_dim == 1 else "gated_profile_film"
 
     def gate_logit(self, features: torch.Tensor) -> torch.Tensor:
-        """Return pre-sigmoid gate logit (B, 1). No has_profile mask — used as
-        the prediction target of the oracle-supervised BCE auxiliary loss."""
+        """Return pre-sigmoid gate logit (B, gate_out_dim). No has_profile mask."""
         return self.gate_mlp(self.feature_norm(features))
 
+    def scalar_gate_logit(self, features: torch.Tensor) -> torch.Tensor:
+        """Per-example (B, 1) logit — the prediction target of the
+        oracle-supervised BCE auxiliary loss. Identical to gate_logit for the
+        scalar gate; mean over dimensions for the FiLM gate."""
+        return self.gate_logit(features).mean(dim=-1, keepdim=True)
+
     def gate(self, features: torch.Tensor, has_profile: torch.Tensor) -> torch.Tensor:
-        """Return per-example gate in [0, 1] (B, 1). Zeros where has_profile == 0."""
+        """Return per-example gate in [0, 1], shape (B, gate_out_dim).
+        Zeros where has_profile == 0 (has_profile (B, 1) broadcasts)."""
         return torch.sigmoid(self.gate_logit(features)) * has_profile
 
     def forward(

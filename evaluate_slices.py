@@ -27,7 +27,8 @@ from data import (
     load_interactions,
     load_item_texts,
 )
-from evaluation import encode_documents, encode_queries
+from ranking import per_example_ranks  # shared rank path; do not reimplement locally
+from train_fusion import encode_texts_cached, encode_with_dedup, encoder_cache_salt
 from utils import save_json, set_seed
 import cohort_dims
 
@@ -53,51 +54,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-catalog", type=str,
                    choices=["interacted", "metadata"], default="interacted")
     p.add_argument("--encode-batch-size", type=int, default=8)
-    p.add_argument("--doc-chunk-size", type=int, default=4096)
+    p.add_argument("--doc-chunk-size", type=int, default=4096,
+                   help="Query-chunk size for ranking (kept name for shell compat).")
     p.add_argument("--filter-seen-items", action="store_true",
                    help="Mask items in the user's history before ranking (matches train_fusion.py).")
+    p.add_argument("--split", type=str, choices=["test", "val"], default="test")
+    p.add_argument("--emb-cache-dir", type=str, default="",
+                   help="Sharded embedding cache dir (share with train_fusion, "
+                        "e.g. outputs/emb_cache_<tag>). Empty = no caching.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--output-dir", type=str, default=None,
                    help="Where to write per_example.parquet + slice_metrics.json. "
                         "Default: <seqrec_checkpoint>/../slices")
     return p.parse_args()
-
-
-# ---------- per-example scoring ----------
-
-def per_example_ranks(
-    query_emb: np.ndarray,
-    corpus_emb: np.ndarray,
-    gold_indices: np.ndarray,
-    doc_chunk_size: int,
-    seen_indices: Optional[List[np.ndarray]] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Return (rank, gold_score) for each query.
-
-    rank is 1-indexed; ties broken pessimistically (number of items with
-    strictly-greater score, plus 1).
-
-    When `seen_indices` is provided, items in each query's history are masked
-    (-inf) before ranking — matches `filter_seen_items` in train_fusion.py.
-    """
-    n_q, n_c = query_emb.shape[0], corpus_emb.shape[0]
-    gold_score = (query_emb * corpus_emb[gold_indices]).sum(axis=1).astype(np.float32)
-    higher = np.zeros(n_q, dtype=np.int64)
-
-    for start in range(0, n_c, doc_chunk_size):
-        end = min(start + doc_chunk_size, n_c)
-        chunk_scores = query_emb @ corpus_emb[start:end].T
-        if seen_indices is not None:
-            for q_idx, seen in enumerate(seen_indices):
-                if seen.size == 0:
-                    continue
-                local = seen[(seen >= start) & (seen < end)] - start
-                if local.size > 0:
-                    chunk_scores[q_idx, local] = -np.inf
-        higher += (chunk_scores > gold_score[:, None]).sum(axis=1)
-
-    rank = higher + 1
-    return rank.astype(np.int64), gold_score
 
 
 # ---------- cohort aggregation ----------
@@ -203,13 +172,14 @@ def main() -> None:
         valid_item_ids=set(item_to_text.keys()),
     )
     user_sequences = build_user_sequences(interactions)
-    _train, _val, test_examples = build_examples(
+    _train, val_examples, test_examples = build_examples(
         user_sequences=user_sequences,
         item_to_text=item_to_text,
         min_user_seq_len=args.min_user_seq_len,
         max_history_items=args.max_history_items,
         fmt=fmt,
     )
+    test_examples = val_examples if args.split == "val" else test_examples
 
     eval_item_to_text = build_eval_catalog(
         item_to_text=item_to_text,
@@ -229,13 +199,22 @@ def main() -> None:
     model = SentenceTransformer(args.seqrec_checkpoint)
     model.eval()
 
+    cache_salt = encoder_cache_salt(args.seqrec_checkpoint) if args.emb_cache_dir else ""
+    if args.emb_cache_dir:
+        print(f"Embedding cache dir: {args.emb_cache_dir} (salt={cache_salt})")
+
     print(f"Encoding catalog ({len(item_ids):,} items)...")
-    corpus_emb = encode_documents(model, catalog_texts,
-                                  batch_size=args.encode_batch_size).astype(np.float32, copy=False)
-    print(f"Encoding queries ({len(test_examples):,} test examples)...")
+    corpus_emb = encode_texts_cached(
+        model, catalog_texts, args.encode_batch_size, is_query=False,
+        cache_dir=args.emb_cache_dir, cache_name="catalog", cache_salt=cache_salt,
+    )
+    print(f"Encoding queries ({len(test_examples):,} {args.split} examples)...")
     queries = [ex.history_text for ex in test_examples]
-    query_emb = encode_queries(model, queries,
-                               batch_size=args.encode_batch_size).astype(np.float32, copy=False)
+    query_emb = encode_with_dedup(
+        model, queries, args.encode_batch_size, is_query=True,
+        cache_dir=args.emb_cache_dir, cache_name=f"{args.split}_query",
+        cache_salt=cache_salt,
+    )
 
     gold_indices = np.array([id_to_idx[ex.target_item_id] for ex in test_examples],
                             dtype=np.int64)
@@ -250,8 +229,8 @@ def main() -> None:
               f"{np.mean([len(s) for s in seen_indices]):.2f}")
 
     print("Computing per-example ranks...")
-    rank, _ = per_example_ranks(query_emb, corpus_emb, gold_indices,
-                                args.doc_chunk_size, seen_indices=seen_indices)
+    rank = per_example_ranks(query_emb, corpus_emb, gold_indices,
+                             seen_indices=seen_indices)
 
     history_len = np.array([len(ex.history_item_ids) for ex in test_examples],
                            dtype=np.int64)
@@ -326,7 +305,7 @@ def main() -> None:
     payload = {
         "seqrec_checkpoint": args.seqrec_checkpoint,
         "dataset_name": args.dataset_name,
-        "split": "test",
+        "split": args.split,
         "filter_seen_items": bool(args.filter_seen_items),
         "num_examples": int(len(rank)),
         "num_corpus_items": int(len(item_ids)),

@@ -579,7 +579,7 @@ def main() -> None:
         f"({len(needed_keys):,} keys needed by examples)."
     )
 
-    is_gated = args.fusion_head_type == "gated_profile"
+    is_gated = args.fusion_head_type in ("gated_profile", "gated_profile_film")
     train_examples, train_profiles, train_has_prof = resolve_profile_strings(
         train_examples, profile_cache, args.llm_profile_max_history, keep_missing=is_gated
     )
@@ -764,6 +764,7 @@ def main() -> None:
             num_gate_features=len(gate_feature_names),
             gate_mlp_hidden=args.gate_mlp_hidden,
             gate_logit_init=args.gate_logit_init,
+            gate_out_dim=(embed_dim if args.fusion_head_type == "gated_profile_film" else 1),
         ).to(device)
     else:
         head = FusionHead(
@@ -869,7 +870,7 @@ def main() -> None:
                     # is masked to 0 anyway on the rest, so no signal to learn).
                     aux_mask = (hp.squeeze(-1) > 0.5)
                     if aux_mask.any():
-                        aux_logit = head.gate_logit(feats).squeeze(-1)
+                        aux_logit = head.scalar_gate_logit(feats).squeeze(-1)
                         aux_loss_per = torch.nn.functional.binary_cross_entropy_with_logits(
                             aux_logit[aux_mask], y_oracle[aux_mask], reduction="mean",
                             pos_weight=aux_pos_weight_t,
@@ -878,7 +879,7 @@ def main() -> None:
                         epoch_aux_loss_sum += float(aux_loss_per.item()) * int(aux_mask.sum().item())
                         epoch_aux_n += int(aux_mask.sum().item())
                 with torch.no_grad():
-                    gate_now = head.gate(feats, hp).squeeze(-1)
+                    gate_now = head.gate(feats, hp).mean(dim=-1)
                     epoch_gate_sum += float(gate_now.mean().item()) * q.shape[0]
                     epoch_gate_n += q.shape[0]
                     if aux_enabled:
@@ -958,6 +959,7 @@ def main() -> None:
                 ckpt["gate_features"] = gate_feature_names
                 ckpt["gate_mlp_hidden"] = args.gate_mlp_hidden
                 ckpt["gate_logit_init"] = args.gate_logit_init
+                ckpt["gate_out_dim"] = head.gate_out_dim
                 ckpt["item_log_pop_path"] = os.path.join(
                     args.fusion_output_dir, "item_log_pop.json"
                 )
@@ -985,6 +987,7 @@ def main() -> None:
             "gate_features": gate_feature_names,
             "gate_mlp_hidden": args.gate_mlp_hidden,
             "gate_logit_init": args.gate_logit_init,
+            "gate_out_dim": head.gate_out_dim,
             "gate_anchor_lambda": args.gate_anchor_lambda,
             "gate_weight_decay": args.gate_weight_decay,
             "sample_reweight": args.sample_reweight,
